@@ -45,7 +45,7 @@
                 200:
                     description: |
                         Second factor verification code sent.
-                403:
+                401:
                     description: |
                         Invalid username and password.
     ]]></raml-security-scheme>
