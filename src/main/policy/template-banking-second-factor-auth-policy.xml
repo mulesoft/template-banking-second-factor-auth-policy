@@ -7,6 +7,7 @@
         xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
         xmlns:ss="http://www.springframework.org/schema/security"
         xmlns:http="http://www.mulesoft.org/schema/mule/http"
+        xmlns:json="http://www.mulesoft.org/schema/mule/json"
         xmlns:objectstore="http://www.mulesoft.org/schema/mule/objectstore"
         xmlns:api-platform-gw="http://www.mulesoft.org/schema/mule/api-platform-gw"
         online="false"
@@ -17,6 +18,7 @@
               http://www.mulesoft.org/schema/mule/spring-security http://www.mulesoft.org/schema/mule/spring-security/current/mule-spring-security.xsd
               http://www.springframework.org/schema/security http://www.springframework.org/schema/security/spring-security-current.xsd
               http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+              http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd
               http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
               http://www.mulesoft.org/schema/mule/api-platform-gw http://www.mulesoft.org/schema/mule/api-platform-gw/current/mule-api-platform-gw.xsd
               http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
@@ -90,36 +92,40 @@
         filter or manipulate the incoming message.
     -->
     <before>
+        <mule:message-filter onUnaccepted="badCredentials">
+            <mule:expression-filter expression="#[payload != null &amp;&amp; payload.username != null &amp;&amp; payload.password != null]" />
+        </mule:message-filter>
+
     	<!-- Validate username and password with external service. -->
-        <mule:set-payload value="#['username=' + payload.username + '&amp;password=' + payload.password]"/>
+		<mule:set-variable value="#[payload.username]" variableName="username"/>
+		<mule:set-variable value="#[payload.password]" variableName="password"/>
+		<mule:set-variable value="#[(payload.security_code != null) ? payload.security_code : 'not_present' ]" variableName="security_code"/>
+        <mule:set-payload value="#['username=' + username + '&amp;password=' + password]"/>
         <http:request config-ref="Identity_service_HTTP" path="/authorize" method="POST">
         	<http:request-builder>
         		<http:header value="application/x-www-form-urlencoded" headerName="Content-type"/>
         	</http:request-builder>
         	<http:success-status-code-validator values="200,401"/>
         </http:request>
-		<mule:object-to-string-transformer></mule:object-to-string-transformer>    	
+        <json:json-to-object-transformer />
         <mule:message-filter onUnaccepted="badCredentials">
             <mule:expression-filter expression="#[message.inboundProperties['http.status'] != 401]" />
         </mule:message-filter>        
-
-    	<!-- Gets phone number from External ID Service -->
-        <mule:set-variable value="#[payload.phone]" variableName="phone"></mule:set-variable>
+		
+		<!-- Gets phone number from External ID Service -->
+		<mule:set-variable value="#[payload.getAsString(&quot;phone&quot;)]" variableName="phone"/>
 
     	<!-- Validate if the request contains second factor security code -->
         <mule:message-filter onUnaccepted="noSecurityCode">
-            <mule:expression-filter expression="#[payload.security_code != null]" />
+            <mule:expression-filter expression="#[!security_code.equals('not_present')]" />
         </mule:message-filter>
         
-        <!-- Access ObjectStore and retrieve security code using key as "clientId-username" -->
-        <mule:message-filter onUnaccepted="noSecurityCode">
-            <mule:expression-filter expression="#[payload.security_code != null]" />
-        </mule:message-filter>
-		<mule:set-variable value="#[app.registry['SecurityCodesStore'].retrieve( payload.clientId + '-' + payload.username )]" variableName="stored_security_code"/>
+        <!-- Access ObjectStore and retrieve security code using username as key -->
+		<mule:set-variable value="#[app.registry['SecurityCodesStore'].retrieve( flowVars.username )]" variableName="stored_security_code"/>
 
         <!-- Validate second factor code -->
 		<mule:message-filter onUnaccepted="badSecurityCode">
-			<mule:expression-filter expression="#[payload.security_code.equals(flowVars.stored_security_code)]" />
+			<mule:expression-filter expression="#[security_code.equals(flowVars.stored_security_code)]" />
 		</mule:message-filter>
     	
     </before>
@@ -139,26 +145,25 @@
     <!-- Second factor code generation -->
 
     <mule:processor-chain name="noSecurityCode">
-    	<!-- TODO: Generate security code  -->
-    	<mule:set-variable value="security_code" variableName="security_code"/>
+    	<!-- Generate security code  -->
+    	<mule:set-variable value="#[java.util.UUID.randomUUID().toString().substring(0,6)]" variableName="security_code"/>
     	
-    	<!-- Store security code on object store using key as "clientId-username" -->
-    	<mule:set-variable value="#[payload.clientId + '-' + payload.username]" variableName="security_code_key"/>
+    	<!-- Store security code on object store using username as key -->
+    	<mule:set-variable value="#[username]" variableName="security_code_key"/>
 		<mule:expression-component><![CDATA[
 			app.registry['lock'].lock();
-			app.registry['SecurityCodesStore'].store(security_code_key, security_code);
+			if (!app.registry['SecurityCodesStore'].contains(security_code_key))
+				app.registry['SecurityCodesStore'].store(security_code_key, security_code);
 			app.registry['lock'].unlock();
 		]]>
 		</mule:expression-component>
 
         <!-- Send security code  -->
-        <mule:set-payload value="#['{ &quot;message&quot; : &quot;Security code is: ' + flowVars.security_code + '&quot;, &quot;phone&quot;:' + flowVars.phone + '}']"/>
-        <http:request config-ref="Notifications_API_HTTP" path="/notifications" method="POST"/>
-		<mule:object-to-string-transformer></mule:object-to-string-transformer>    	
+        <mule:set-payload value="#['{ &quot;message&quot; : &quot;Security code is: ' + flowVars.security_code + '&quot;, &quot;phone&quot;: ' + flowVars.phone + '}']"/>
+        <http:request config-ref="Notifications_API_HTTP" path="/notifications" method="POST"/>    	
         <mule:message-filter onUnaccepted="errorSendingCode">
             <mule:expression-filter expression="#[message.inboundProperties['http.status'] == 200]" />
         </mule:message-filter>
-    	
         <mule:logger message="The custom policy filtered the message #[message.getId()] enforcing second factor auth." level="DEBUG" />        
         <mule:set-property propertyName="http.status" value="200"/>
         <mule:set-property propertyName="Content-Type" value="application/json"/>
